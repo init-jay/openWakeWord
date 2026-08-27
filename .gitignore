@@ -152,3 +152,4 @@ openwakeword/resources/models/embedding_model.tflite
 openwakeword/resources/models/melspectrogram.onnx
 openwakeword/resources/models/melspectrogram.tflite
 openwakeword/resources/models/silero_vad.onnx
+models/*.onnx
