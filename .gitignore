@@ -142,3 +142,13 @@ examples/
 
 # archive files
 archive/
+
+# Local wake-word voice data (audio, not source)
+voice_data/
+openwakeword/resources/models/alexa_v0.1.onnx
+openwakeword/resources/models/alexa_v0.1.tflite
+openwakeword/resources/models/embedding_model.onnx
+openwakeword/resources/models/embedding_model.tflite
+openwakeword/resources/models/melspectrogram.onnx
+openwakeword/resources/models/melspectrogram.tflite
+openwakeword/resources/models/silero_vad.onnx
