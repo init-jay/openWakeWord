@@ -4,15 +4,19 @@
 detection firing**, subject to a CPU budget that keeps an always-on detector viable
 on the target device.
 
-Current felt latency: **229 ms median** from end of speech (54/56 real clips at
-threshold 0.5).
+Current felt latency: **191 ms median** from end of speech, at a 40 ms prediction step
+(56/56 real clips at threshold 0.5). It was 220 ms at the original 80 ms step.
+
+> **Done: option 2, the finer frame step.** `step_samples=640` cuts 29.5 ms and
+> improves detection from 55/56 to 56/56, for 2x the CPU (1.83% -> 3.62% of a core).
+> Default behaviour is unchanged and bit-identical; this is opt-in.
 
 The uncomfortable headline, measured rather than assumed:
 
-> **Every CPU-side lever available, combined, is worth about 60 ms of that 229 ms.**
-> The remaining ~170 ms is the model needing to see the phrase before its score
-> rises. Only a training change moves it, and that is the option with by far the
-> highest ceiling.
+> **Every CPU-side lever available, combined, is worth about 60 ms of the original
+> 220 ms** — roughly half of which is now banked. The remaining ~170 ms is the model
+> needing to see the phrase before its score rises. Only a training change moves it,
+> and that is the option with by far the highest ceiling.
 
 Compute optimization is **not** a latency lever. It reaches felt latency through one
 narrow channel — funding a finer frame step — and is otherwise a duty-cycle concern.
@@ -170,11 +174,52 @@ Unknowns that must be measured, not assumed:
 This is the only option that attacks the 74% of latency everything else cannot reach.
 It should be tried before any further compute work.
 
-### 2. Finer frame step — measured, ~24 ms, costs CPU linearly
+### 2. Finer frame step — DONE, 29.5 ms, costs CPU linearly
 
-Run predictions more often than every 80 ms. Simulated exactly by running two
-interleaved phases 640 samples apart and merging the score streams — no model change
-needed, just 2x the embedding work.
+**Implemented.** `AudioFeatures` takes a `step_samples` argument, plumbed through
+`Model(**kwargs)`:
+
+```python
+Model(wakeword_models=[path], inference_framework="onnx", step_samples=640)
+```
+
+It must divide 1280 evenly (1280 / 640 / 320 / 160 = 80 / 40 / 20 / 10 ms), because
+the wakeword model always consumes 16 embeddings spaced 80 ms apart. A smaller step
+does not change that grid — it interleaves `1280 // step_samples` phases of it, and
+`get_features` strides by that factor to pick one out. No model change, no retraining.
+
+Measured over all 56 clips, with a realistic noise floor rather than digital silence:
+
+| step | detected | median | p90 | CPU per s of audio |
+|---:|---:|---:|---:|---:|
+| 1280 (80 ms) | 55/56 | 220.2 ms | 296.1 ms | 18.3 ms (1.83%) |
+| **640 (40 ms)** | **56/56** | **190.7 ms** | 295.2 ms | 36.2 ms (3.62%) |
+
+**29.5 ms faster, and it detects every clip** — slightly better than the 24 ms the
+phase-interleaving simulation predicted. Cost is exactly 2x CPU, as expected.
+
+Correctness: at the default step the output is **bit-identical** to before the change
+(692 scores across all three `predict` paths, `max abs diff 0.0`). At 640 the
+melspectrograms and wakeword inputs are **bit-identical to the 80 ms stream** given
+any realistic noise floor.
+
+One caveat, worth knowing because it affects the eval scripts: with *exact digital
+silence* the two step sizes diverge on 8 of 633 melspectrogram frames, always at the
+boundary where silence meets speech. This is the sensitivity `_streaming_melspectrogram`
+already documents ("padding with 0 or very small values seems to demonstrate the
+differences well") — the amount of lookback inside one melspectrogram call differs
+between step sizes, and near-zero input makes that visible. It does not occur with mic
+audio. `eval_model.py` and `compare_models.py` pad with `np.zeros`, so they sit exactly
+on this case; padding with a few LSB of noise instead would remove the artifact.
+
+Remaining headroom: 320 and 160 sample steps are supported and would cut the frame
+quantization further, at 4x and 8x CPU. Extrapolating, the full remaining gain is only
+another ~10-15 ms, so 640 is likely the sweet spot unless CPU is free.
+
+#### How it was measured before implementing
+
+Simulated by running two interleaved phases 640 samples apart and merging the score
+streams — no model change needed, just 2x the embedding work.
 
 | threshold | 80 ms step (now) | | 40 ms step (2 phases) | |
 |---|---:|---:|---:|---:|

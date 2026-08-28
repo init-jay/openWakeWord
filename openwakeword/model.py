@@ -278,15 +278,16 @@ class Model():
             timing_dict["models"]["preprocessor"] = time.time() - feature_start
 
         # Get predictions from model(s)
+        step_samples = self.preprocessor.step_samples
         predictions = {}
         for mdl in self.models.keys():
             if timing:
                 model_start = time.time()
 
             # Run model to get predictions
-            if n_prepared_samples > 1280:
+            if n_prepared_samples > step_samples:
                 group_predictions = []
-                for i in np.arange(n_prepared_samples//1280-1, -1, -1):
+                for i in np.arange(n_prepared_samples//step_samples-1, -1, -1):
                     group_predictions.extend(
                         self.model_prediction_function[mdl](
                             self.preprocessor.get_features(
@@ -296,11 +297,11 @@ class Model():
                         )
                     )
                 prediction = np.array(group_predictions).max(axis=0)[None, ]
-            elif n_prepared_samples == 1280:
+            elif n_prepared_samples == step_samples:
                 prediction = self.model_prediction_function[mdl](
                     self.preprocessor.get_features(self.model_inputs[mdl])
                 )
-            elif n_prepared_samples < 1280:  # get previous prediction if there aren't enough samples
+            elif n_prepared_samples < step_samples:  # get previous prediction if there aren't enough samples
                 if self.model_outputs[mdl] == 1:
                     if len(self.prediction_buffer[mdl]) > 0:
                         prediction = [[[self.prediction_buffer[mdl][-1]]]]
@@ -385,7 +386,7 @@ class Model():
         else:
             return predictions
 
-    def predict_clip(self, clip: Union[str, np.ndarray], padding: int = 1, chunk_size=1280, **kwargs):
+    def predict_clip(self, clip: Union[str, np.ndarray], padding: int = 1, chunk_size=None, **kwargs):
         """Predict on an full audio clip, simulating streaming prediction.
         The input clip must bit a 16-bit, 16 khz, single-channel WAV file.
 
@@ -395,11 +396,15 @@ class Model():
             padding (int): How many seconds of silence to pad the start/end of the clip with
                             to make sure that short clips can be processed correctly (default: 1)
             chunk_size (int): The size (in samples) of each chunk of audio to pass to the model
+                              (default: the model's prediction step, normally 1280)
             kwargs: Any keyword arguments to pass to the class `predict` method
 
         Returns:
             list: A list containing the frame-level prediction dictionaries for the audio clip
         """
+        if chunk_size is None:
+            chunk_size = self.preprocessor.step_samples
+
         if isinstance(clip, str):
             # Load audio clip as 16-bit PCM data
             with wave.open(clip, mode='rb') as f:

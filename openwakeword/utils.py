@@ -85,7 +85,8 @@ class AudioFeatures():
                  sr: int = 16000,
                  ncpu: int = 1,
                  inference_framework: str = "onnx",
-                 device: str = 'cpu'
+                 device: str = 'cpu',
+                 step_samples: int = 1280
                  ):
         """
         Initialize the AudioFeatures object.
@@ -95,6 +96,13 @@ class AudioFeatures():
             embedding_model_path (str): The path to the model for Google's `speech_embedding` model
             sr (int): The sample rate of the audio (default: 16000 khz)
             ncpu (int): The number of CPUs to use when computing melspectrograms and audio features (default: 1)
+            step_samples (int): How many samples of audio to accumulate before running a prediction
+                                (default: 1280, i.e. 80 ms). Smaller values make predictions more
+                                often, which reduces detection latency by up to one step at a
+                                proportional increase in CPU cost. Must divide 1280 evenly, because
+                                the wakeword model always consumes 16 embeddings spaced 80 ms apart;
+                                a smaller step simply interleaves that many phases of that same
+                                grid. 640 gives 40 ms steps and two interleaved phases.
             inference_framework (str): The inference framework to use when for model prediction. Options are
                                        "tflite" or "onnx". The default is "tflite" as this results in better
                                        efficiency on common platforms (x86, ARM64), but in some deployment
@@ -204,6 +212,16 @@ class AudioFeatures():
 
             self.embedding_model_predict = tflite_embedding_predict
 
+        # Prediction step. The melspectrogram hop is 160 samples, and the wakeword models consume
+        # 16 embeddings spaced 8 melspectrogram frames (80 ms) apart. A step smaller than 1280
+        # therefore interleaves `phases` copies of that same 80 ms grid, offset from each other.
+        if 1280 % step_samples != 0:
+            raise ValueError(f"step_samples must divide 1280 evenly, got {step_samples}. "
+                             "Valid values are 1280 (80 ms), 640 (40 ms), 320 (20 ms) and 160 (10 ms).")
+        self.step_samples = step_samples
+        self.melspec_step = step_samples // 160  # new melspectrogram frames produced per step
+        self.phases = 1280 // step_samples  # interleaved copies of the 80 ms embedding grid
+
         # Create databuffers with empty/random data
         self.raw_data_buffer = _RawAudioBuffer(maxlen=sr*10)
         self.melspectrogram_buffer = np.ones((76, 32))  # n_frames x num_features
@@ -213,9 +231,10 @@ class AudioFeatures():
         # The feature buffer is primed with the embeddings of 4 seconds of random audio. Embedding
         # that audio costs ~50 ms, so it is done once here and the result re-used by `reset`, which
         # also makes repeated resets reproducible instead of re-priming with fresh noise each time.
-        self._primed_feature_buffer = self._get_embeddings(np.random.randint(-1000, 1000, 16000*4).astype(np.int16))
+        self._primed_feature_buffer = self._get_embeddings(np.random.randint(-1000, 1000, 16000*4).astype(np.int16),
+                                                           step_size=self.melspec_step)
         self.feature_buffer = self._primed_feature_buffer.copy()
-        self.feature_buffer_max_len = 120  # ~10 seconds of feature buffer history
+        self.feature_buffer_max_len = 120*self.phases  # ~10 seconds of feature buffer history
 
     def reset(self):
         """Reset the internal buffers"""
@@ -274,7 +293,7 @@ class AudioFeatures():
         """Function to compute the embeddings of the provide audio samples."""
         spec = self._get_melspectrogram(x, **kwargs)
         windows = []
-        for i in range(0, spec.shape[0], 8):
+        for i in range(0, spec.shape[0], step_size):
             window = spec[i:i+window_size]
             if window.shape[0] == window_size:  # truncate short windows
                 windows.append(window)
@@ -462,8 +481,8 @@ class AudioFeatures():
             x = np.concatenate((self.raw_data_remainder, x))
             self.raw_data_remainder = np.empty(0)
 
-        if self.accumulated_samples + x.shape[0] >= 1280:
-            remainder = (self.accumulated_samples + x.shape[0]) % 1280
+        if self.accumulated_samples + x.shape[0] >= self.step_samples:
+            remainder = (self.accumulated_samples + x.shape[0]) % self.step_samples
             if remainder != 0:
                 x_even_chunks = x[0:-remainder]
                 self._buffer_raw_data(x_even_chunks)
@@ -478,12 +497,12 @@ class AudioFeatures():
             self._buffer_raw_data(x)
 
         # Only calculate melspectrogram once minimum samples are accumulated
-        if self.accumulated_samples >= 1280 and self.accumulated_samples % 1280 == 0:
+        if self.accumulated_samples >= self.step_samples and self.accumulated_samples % self.step_samples == 0:
             self._streaming_melspectrogram(self.accumulated_samples)
 
             # Calculate new audio embeddings/features based on update melspectrograms
-            for i in np.arange(self.accumulated_samples//1280-1, -1, -1):
-                ndx = -8*i
+            for i in np.arange(self.accumulated_samples//self.step_samples-1, -1, -1):
+                ndx = -self.melspec_step*i
                 ndx = ndx if ndx != 0 else len(self.melspectrogram_buffer)
                 x = self.melspectrogram_buffer[-76 + ndx:ndx].astype(np.float32)[None, :, :, None]
                 if x.shape[1] == 76:
@@ -500,12 +519,24 @@ class AudioFeatures():
         return processed_samples if processed_samples != 0 else self.accumulated_samples
 
     def get_features(self, n_feature_frames: int = 16, start_ndx: int = -1):
+        """Return `n_feature_frames` embeddings spaced 80 ms apart, as the wakeword models expect.
+
+        When `step_samples` is smaller than 1280 the feature buffer holds several interleaved
+        phases of the 80 ms grid, so the window is strided by `self.phases` to pick out one of
+        them. With the default step this is a plain contiguous slice.
+        """
+        stride = self.phases
+        span = (int(n_feature_frames) - 1)*stride + 1  # buffer frames covered by the strided window
+
         if start_ndx != -1:
-            end_ndx = start_ndx + int(n_feature_frames) \
-                if start_ndx + n_feature_frames != 0 else len(self.feature_buffer)
-            return self.feature_buffer[start_ndx:end_ndx, :][None, ].astype(np.float32)
+            # `start_ndx` is passed as `-n_feature_frames - i`, i.e. the window ending i frames
+            # back from the newest. Recover that end position and stride backwards from it.
+            end_ndx = start_ndx + int(n_feature_frames)
+            if end_ndx >= 0:
+                return self.feature_buffer[-span::stride, :][None, ].astype(np.float32)
+            return self.feature_buffer[end_ndx - span:end_ndx:stride, :][None, ].astype(np.float32)
         else:
-            return self.feature_buffer[int(-1*n_feature_frames):, :][None, ].astype(np.float32)
+            return self.feature_buffer[-span::stride, :][None, ].astype(np.float32)
 
     def __call__(self, x):
         return self._streaming_features(x)
