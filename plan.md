@@ -188,6 +188,51 @@ window edge. Note the eval clips in `my_real_samples/jay` are trimmed to a media
 0 ms trailing, so they are *not* the source of the 440 ms — the training positives
 need checking directly.
 
+#### The negative corpus, and what it changed
+
+100 TTS negatives now live in `~/Documents/Repos/openwakeword-training/negatives_tts`
+(16 kHz mono, 18 voices, generated from a local Kokoro server; the generator is
+`gen_negatives.py`). They are weighted towards the decision actually being made rather
+than being 100 random sentences. Peak score per clip, at a 40 ms step:
+
+| category | n | mean | max | >=0.5 |
+|---|---:|---:|---:|---:|
+| A phrase-extending ("hey serious", "hey series", "hey Sirius") | 20 | 0.633 | 0.995 | **13** |
+| B siri-sounds in running speech, no "hey" | 12 | 0.013 | 0.147 | 0 |
+| C "hey" + other word ("hey Sarah", "hey Cindy") | 12 | 0.330 | 0.947 | **5** |
+| D bare commands | 12 | 0.001 | 0.002 | 0 |
+| E other assistants' wake words | 8 | 0.001 | 0.001 | 0 |
+| F general conversation | 36 | 0.001 | 0.001 | 0 |
+
+The model is clean on ordinary speech and **already badly broken on anything starting
+"hey s-"**, today, with the full 440 ms of trailing context in place.
+
+**This reverses the caution recorded earlier in this document.** The worry was that
+cutting trailing context would cost false-accept protection against phrase-extending
+words. That protection does not exist: "hey serious" scores 0.994 with the entire word
+inside the window — the peak occurs at the end of the clip, with the extra syllables
+fully visible, and the score only falls once the phrase leaves the window altogether.
+The 440 ms is doing **alignment, not discrimination**. Cutting it forfeits nothing.
+
+#### Revised design for the retrain
+
+1. **Control the trailing gap explicitly.** Place the phrase so it ends 100-150 ms
+   before the window edge instead of the ~440 ms that the source clips' trailing room
+   tone currently produces. Worth ~100-150 ms of latency.
+2. **Add hard negatives.** "hey ser-/sir-" extensions and "hey + name" are the failure
+   mode, and they are cheap to mass-produce with the TTS server now that the pattern is
+   known. Without this the retrain ships the existing false accepts.
+3. **Vary the trailing content** between silence and the onset of command speech, which
+   is what fixes the 67% detection rate on "hey siri what's the time" (below).
+4. Keep *some* trailing margin. Once hard negatives are in the training set, the model
+   needs to hear the next phoneme or two to reject an extension — so the margin becomes
+   load-bearing, which it is not today. 100-150 ms is enough for that and cheap in
+   latency; 440 ms is neither.
+
+Re-measure both latency and this false-accept table after the retrain. The corpus is
+adversarial by construction, so judge the two right-hand categories on their own —
+the general-conversation row is the realistic background rate.
+
 Shrinking the receptive field is the secondary lever, and it is set by how many
 embedding frames the wakeword head consumes:
 
