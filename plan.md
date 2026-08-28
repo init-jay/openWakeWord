@@ -143,10 +143,53 @@ This is also the number a training-side change would attack — see option 3.
 
 Ordered by ceiling, not by ease.
 
-### 1. Shorten the model's receptive field — highest ceiling, unmeasured
+### 1. Fix where the phrase sits in the window — highest ceiling, now measured
 
-The ~170 ms of window fill is set by the 1.96 s receptive field, and the receptive
-field is set by how many embedding frames the wakeword head consumes:
+**This is the big one: worth ~200-440 ms, against the 30 ms everything else bought.**
+
+The 1.96 s field does not simply hold a 0.72 s phrase with room to spare. The model
+learned to expect the phrase at a *specific position* in that window, and it will not
+fire until the audio has advanced far enough to put it there. Measured across the 56
+clips, score against how much audio has arrived since the phrase ended:
+
+```
+   t after phrase end   lead-in   trailing   median score
+        0 ms             1.24 s     0.00 s   0.001
+      160 ms             1.08 s     0.16 s   0.418  ████████
+      240 ms             1.00 s     0.24 s   0.975  ███████████████████
+      440 ms             0.80 s     0.44 s   0.992  ███████████████████   <- peak
+      640 ms             0.60 s     0.64 s   0.966  ███████████████████
+      720 ms             0.52 s     0.72 s   0.617  ████████████
+      800 ms             0.44 s     0.80 s   0.053  █
+     1000 ms             0.24 s     1.00 s   0.001
+```
+
+The model scores **0.001 when the phrase sits flush against the trailing edge** and
+peaks only once ~440 ms of trailing audio exists. Score >= 0.5 spans t in
+[200, 720] ms — a 520 ms window of opportunity, after which it collapses again.
+
+**That ~200 ms minimum is the window fill.** It is not the model "thinking"; it is the
+model waiting for audio that does not exist yet. Cutting it means retraining so the
+phrase is recognised at the trailing edge rather than 440 ms inside it.
+
+Two things confirm this is a training-alignment property and not an inference bug:
+
+- Feeding a hand-built window through the **training** feature path (`embed_clips`)
+  reproduces the curve exactly — 0.001 at flush, 0.841 at 440 ms of trailing pad.
+- `create_fixed_size_clip` (and the `place_in_window` mirror of it in
+  `augment_positives.py`) places the *input clip* flush against the window end with
+  0-200 ms of jitter. Whatever trailing room tone those clips carry therefore sets
+  how far inside the window the phrase actually lands — and that is what the model
+  learns to expect.
+
+So the concrete first experiment is **not** to shrink the window. It is to check the
+trailing silence on the training positives and re-cut them so the phrase ends at the
+window edge. Note the eval clips in `my_real_samples/jay` are trimmed to a median of
+0 ms trailing, so they are *not* the source of the 440 ms — the training positives
+need checking directly.
+
+Shrinking the receptive field is the secondary lever, and it is set by how many
+embedding frames the wakeword head consumes:
 
 | head input frames | receptive field | vs today |
 |---:|---:|---:|
