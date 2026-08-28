@@ -8,8 +8,11 @@ Current felt latency: **191 ms median** from end of speech, at a 40 ms predictio
 (56/56 real clips at threshold 0.5). It was 220 ms at the original 80 ms step.
 
 > **Done: option 2, the finer frame step.** `step_samples=640` cuts 29.5 ms and
-> improves detection from 55/56 to 56/56, for 2x the CPU (1.83% -> 3.62% of a core).
-> Default behaviour is unchanged and bit-identical; this is opt-in.
+> improves detection from 55/56 to 56/56, for 2x the CPU. Library defaults stay
+> conservative (80 ms step, one thread); the Pi tuning is set at the call site:
+> `--step_samples 640 --ncpu 2`, which is 4.39% of a core with 31x realtime headroom.
+> See `compute-cost.md` for the CPU side, including the thread-spinning trap that
+> `ncpu > 1` required fixing.
 
 The uncomfortable headline, measured rather than assumed:
 

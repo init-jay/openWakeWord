@@ -95,11 +95,20 @@ class AudioFeatures():
             melspec_model_path (str): The path to the model for computing melspectograms from audio data
             embedding_model_path (str): The path to the model for Google's `speech_embedding` model
             sr (int): The sample rate of the audio (default: 16000 khz)
-            ncpu (int): The number of CPUs to use when computing melspectrograms and audio features (default: 1)
+            ncpu (int): The number of CPU threads to use for the melspectrogram and embedding
+                        models (default: 1). Threading lowers the wall-clock cost of each
+                        prediction but raises the total CPU consumed, because the parallel work
+                        does not come for free — measured here, 2 threads cost 21% more CPU for
+                        12% less wall-clock per step. It buys scheduling headroom, not
+                        efficiency, so raise it only on a multi-core target that needs the
+                        margin. Values above 2 buy very little: these models are small and stop
+                        scaling past two threads.
             step_samples (int): How many samples of audio to accumulate before running a prediction
                                 (default: 1280, i.e. 80 ms). Smaller values make predictions more
                                 often, which reduces detection latency by up to one step at a
-                                proportional increase in CPU cost. Must divide 1280 evenly, because
+                                proportional increase in CPU cost. Measured over 56 real clips,
+                                640 (40 ms) cuts median detection latency by 29.5 ms for 2x the
+                                CPU. Must divide 1280 evenly, because
                                 the wakeword model always consumes 16 embeddings spaced 80 ms apart;
                                 a smaller step simply interleaves that many phases of that same
                                 grid. 640 gives 40 ms steps and two interleaved phases.
@@ -127,10 +136,23 @@ class AudioFeatures():
             if ".tflite" in melspec_model_path or ".tflite" in embedding_model_path:
                 raise ValueError("The onnx inference framework is selected, but tflite models were provided!")
 
-            # Initialize ONNX options
+            # Initialize ONNX options.
+            #
+            # Only intra-op parallelism is useful here. The graph runs in ORT's sequential
+            # execution mode, so inter-op threads would be allocated and never used.
+            #
+            # Spinning must be turned off whenever more than one thread is used. ORT's
+            # intra-op pool busy-waits for the next inference by default, which is a good
+            # trade for back-to-back batch work and a very bad one for an always-on
+            # detector that is idle ~95% of the time between steps. Measured on this
+            # workload: with spinning left on, ncpu=2 consumed 36.9% of a core and ncpu=4
+            # consumed 99.7% — a whole core burned doing nothing. With it off, 14.4% and
+            # 17.1% respectively.
             sessionOptions = ort.SessionOptions()
-            sessionOptions.inter_op_num_threads = ncpu
+            sessionOptions.inter_op_num_threads = 1
             sessionOptions.intra_op_num_threads = ncpu
+            if ncpu > 1:
+                sessionOptions.add_session_config_entry("session.intra_op.allow_spinning", "0")
 
             # Melspectrogram model
             self.melspec_model = ort.InferenceSession(melspec_model_path, sess_options=sessionOptions,

@@ -146,6 +146,24 @@ doubles the embedding work, so this headroom is roughly what a 40 ms step costs:
 optimization makes that step affordable at 3.6%, where before it would have cost
 5.4%.
 
+### Current configuration
+
+**Library defaults stay conservative** — `step_samples=1280` (80 ms) and `ncpu=1` —
+so that a single-core or power-constrained target is never silently charged for
+tuning it did not ask for. The Pi tuning is applied at the call site instead:
+
+```bash
+python examples/detect_from_microphone.py --step_samples 640 --ncpu 2
+```
+
+That is **4.39% of a core with 31x realtime headroom** on this machine. A Pi core is
+several times slower, so expect proportionally more — still comfortably real-time at
+a 40 ms step, with two cores left free.
+
+Note that `--chunk_size` now follows `--step_samples`. Reading larger chunks from the
+microphone than the prediction step throws the latency benefit away: `predict` will
+process both phases at once, but the result still only arrives once per read.
+
 ---
 
 ## Measured and rejected — do not retry
@@ -162,24 +180,50 @@ optimization makes that step affordable at 3.6%, where before it would have cost
 
 ## Remaining options
 
-### A. Thread count — free, available today, no code change
+### A. Thread count — DONE, default is now `ncpu=2`
 
-`ncpu` already plumbs through `Model(**kwargs)` into the ORT session options:
+`ncpu` sets the intra-op thread count for the melspectrogram and embedding models:
 
 ```python
-Model(wakeword_models=[path], inference_framework="onnx", ncpu=4)
+Model(wakeword_models=[path], inference_framework="onnx", ncpu=2)  # now the default
 ```
 
-| | ms/frame | realtime |
+**The important part is not the thread count — it is that spinning had to be turned
+off.** ORT's intra-op pool busy-waits for the next inference by default. That is right
+for back-to-back batch work and badly wrong for an always-on detector idle ~95% of the
+time between steps. Measured on the embedding model, inferring once per 40 ms:
+
+| | ms/infer | CPU actually consumed |
 |---|---:|---:|
-| `ncpu=1` | 1.478 | 54x |
-| `ncpu=2` | 1.071 | 75x |
-| `ncpu=4` | 0.838 | 95x |
+| `ncpu=1` | 1.342 | 9.8% of a core |
+| `ncpu=2`, spinning on (ORT default) | 0.851 | **36.9%** |
+| `ncpu=2`, spinning off | 1.117 | 14.4% |
+| `ncpu=4`, spinning on (ORT default) | 0.625 | **99.7% — a whole core burned idling** |
+| `ncpu=4`, spinning off | 1.089 | 17.1% |
 
-Sensible on a laptop or desktop. A poor trade on a Pi-class target, where the whole
-point is to leave cores free — keep `ncpu=1` there.
+`AudioFeatures` now sets `session.intra_op.allow_spinning=0` whenever `ncpu > 1`, and
+sets `inter_op_num_threads=1` because the graph runs sequentially and inter-op threads
+would only be allocated and never used.
 
-Combined with the buffer fix this is **~2.6x over baseline**.
+End-to-end through `Model.predict` at a 640-sample step, with spinning off:
+
+| | wall per step | CPU per step | duty cycle | realtime headroom |
+|---|---:|---:|---:|---:|
+| `ncpu=1` | 1.454 ms | 1.453 ms | 3.63% | 28x |
+| **`ncpu=2`** | **1.278 ms** | 1.757 ms | 4.39% | 31x |
+| `ncpu=4` | 1.195 ms | 2.123 ms | 5.31% | 33x |
+
+Read that carefully: threading lowers the *wall-clock* cost of a step by 12% but
+raises the *total CPU* it consumes by 21%, because the parallel work does not come for
+free. It buys scheduling headroom, not efficiency.
+
+`ncpu=4` is not worth it — 6% more wall-clock headroom than `ncpu=2` for 21% more CPU
+again. These models are small and stop scaling past two threads. On a 4-core Pi,
+`ncpu=2` leaves two cores for everything else.
+
+Numerics: threading changes scores by at most **1.3e-6** (parallel reduction order);
+peak scores are identical to six decimals. `ncpu=1` remains bit-identical to the
+pre-optimization baseline.
 
 ### B. int8 quantization — unproven, needs an accuracy gate
 
