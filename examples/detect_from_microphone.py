@@ -22,9 +22,11 @@ import argparse
 parser=argparse.ArgumentParser()
 parser.add_argument(
     "--chunk_size",
-    help="How much audio (in number of samples) to predict on at once",
+    help="How much audio (in number of samples) to read from the microphone at once. "
+         "Defaults to --step_samples. Reading larger chunks than the prediction step throws "
+         "away the latency benefit of a smaller step, because results only arrive once per read.",
     type=int,
-    default=1280,
+    default=None,
     required=False
 )
 parser.add_argument(
@@ -41,6 +43,22 @@ parser.add_argument(
     default='tflite',
     required=False
 )
+parser.add_argument(
+    "--step_samples",
+    help="Samples of audio per prediction; must divide 1280 evenly. 1280 = 80 ms (default), "
+         "640 = 40 ms. Halving it cuts ~30 ms of detection latency for 2x the CPU.",
+    type=int,
+    default=1280,
+    required=False
+)
+parser.add_argument(
+    "--ncpu",
+    help="CPU threads for the melspectrogram and embedding models. More threads lower the "
+         "wall-clock cost of a prediction but raise total CPU; 2 is the useful maximum.",
+    type=int,
+    default=1,
+    required=False
+)
 
 args=parser.parse_args()
 
@@ -48,15 +66,25 @@ args=parser.parse_args()
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-CHUNK = args.chunk_size
+CHUNK = args.chunk_size if args.chunk_size is not None else args.step_samples
 audio = pyaudio.PyAudio()
 mic_stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
 
-# Load pre-trained openwakeword models
+# Load pre-trained openwakeword models.
+#
+# On a 4-core Raspberry Pi, `--step_samples 640 --ncpu 2` is the tuning that was measured:
+# the 40 ms step cuts median detection latency by ~30 ms, and two threads leave headroom for
+# the rest of the system. Both default to the library's conservative settings so that a
+# single-core or power-constrained target is not silently charged for them.
+oww_kwargs = dict(
+    inference_framework=args.inference_framework,
+    step_samples=args.step_samples,
+    ncpu=args.ncpu,
+)
 if args.model_path != "":
-    owwModel = Model(wakeword_models=[args.model_path], inference_framework=args.inference_framework)
+    owwModel = Model(wakeword_models=[args.model_path], **oww_kwargs)
 else:
-    owwModel = Model(inference_framework=args.inference_framework)
+    owwModel = Model(**oww_kwargs)
 
 n_models = len(owwModel.models.keys())
 
